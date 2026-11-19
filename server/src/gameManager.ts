@@ -7,6 +7,7 @@ import {
   type GamePhase,
   type GeoPoint,
   type GpsPingItem,
+  type HunterRadarSpot,
   type MatchEvent,
   type PendingTagClaim,
   type PlayerRole,
@@ -14,6 +15,7 @@ import {
   type PublicPlayer,
   type RoomSettings,
   type RoomSnapshot,
+  type SecretRadarTokenState,
   type VideoPingItem,
   type WheelCandidate,
   type WheelSpinState,
@@ -42,6 +44,7 @@ interface InternalPlayer {
   pendingPing?: InternalPendingPing;
   pingSubmittedRound?: number;
   pendingTagClaim?: PendingTagClaim;
+  radarToken?: SecretRadarTokenState;
   lastLocationEventAt: number;
 }
 
@@ -305,12 +308,26 @@ export class GameManager {
     roomCode: string,
     playerId: string,
     sessionToken: string
-  ): { ok: true; roomCode: string; playerId: string } | { ok: false; error: string } {
+  ):
+    | { ok: true; roomCode: string; playerId: string }
+    | { ok: false; error: string; errorCode: 'SESSION_EXPIRED' } {
     const room = this.rooms.get(roomCode.trim().toUpperCase());
-    if (!room) return { ok: false, error: 'Session expired or lobby closed.' };
+    if (!room) {
+      return {
+        ok: false,
+        error: 'Session expired or lobby closed.',
+        errorCode: 'SESSION_EXPIRED',
+      };
+    }
 
     const player = room.players.find((p) => p.id === playerId && p.sessionToken === sessionToken);
-    if (!player) return { ok: false, error: 'Invalid session credentials.' };
+    if (!player) {
+      return {
+        ok: false,
+        error: 'Invalid session credentials.',
+        errorCode: 'SESSION_EXPIRED',
+      };
+    }
 
     if (player.socketId && player.socketId !== socketId) {
       this.socketToSession.delete(player.socketId);
@@ -336,21 +353,13 @@ export class GameManager {
     const player = room.players.find((p) => p.id === session.playerId);
     if (!player) return;
 
+    // Keep the player's slot & host role intact when phones lock or background temporarily
     if (player.socketId === socketId) {
       player.socketId = null;
       player.connected = false;
     }
 
-    // Reassign host if host disconnected while in LOBBY and another connected player exists
-    if (player.isHost && room.phase === 'LOBBY') {
-      const nextHost = room.players.find((p) => p.connected && p.id !== player.id);
-      if (nextHost) {
-        player.isHost = false;
-        nextHost.isHost = true;
-        this.addEvent(room, 'SYSTEM', `${nextHost.name} is now the lobby host`);
-      }
-    }
-
+    room.lastActivityAt = Date.now();
     this.onRoomChanged(room.code);
   }
 
@@ -430,6 +439,9 @@ export class GameManager {
     if (typeof patch.keepVideos === 'boolean') {
       next.keepVideos = patch.keepVideos;
     }
+    if (typeof patch.hunterRadarToken === 'boolean') {
+      next.hunterRadarToken = patch.hunterRadarToken;
+    }
     if (patch.boundaryGraceSec !== undefined) {
       next.boundaryGraceSec = clampInt(patch.boundaryGraceSec, 0, 30, next.boundaryGraceSec);
     }
@@ -493,6 +505,7 @@ export class GameManager {
       p.pendingPing = undefined;
       p.pingSubmittedRound = undefined;
       p.pendingTagClaim = undefined;
+      p.radarToken = undefined;
     }
 
     room.videoPings = [];
@@ -586,15 +599,26 @@ export class GameManager {
   private finishWheelAndStartHeadstart(room: InternalRoom): void {
     const hunterSet = new Set(room.wheelSelectedIds);
     const hunterNames: string[] = [];
+    const runners: InternalPlayer[] = [];
 
     for (const p of room.players) {
+      p.radarToken = undefined;
       if (hunterSet.has(p.id)) {
         p.role = 'HUNTER';
         hunterNames.push(p.name);
       } else {
         p.role = 'RUNNER';
+        runners.push(p);
       }
       p.status = 'ALIVE';
+    }
+
+    // Secretly grant 1 random runner a one-time Hunter Radar Token if enabled by lobby host
+    if (room.settings.hunterRadarToken && runners.length > 0) {
+      const luckyRunner = runners[crypto.randomInt(0, runners.length)];
+      if (luckyRunner) {
+        luckyRunner.radarToken = { available: true };
+      }
     }
 
     const now = Date.now();
@@ -1051,10 +1075,10 @@ export class GameManager {
       p.pendingPing = undefined;
       p.pingSubmittedRound = undefined;
       p.pendingTagClaim = undefined;
+      p.radarToken = undefined;
     }
 
-    // Remove disconnected players when cycling back to lobby
-    room.players = room.players.filter((p) => p.connected);
+    // Keep temporarily disconnected players (locked phone) in the lobby; host can kick manually
     if (!room.players.some((p) => p.isHost) && room.players[0]) {
       room.players[0].isHost = true;
     }
@@ -1063,6 +1087,50 @@ export class GameManager {
     this.addEvent(room, 'SYSTEM', 'Returned to lobby for a new round');
     this.onRoomChanged(room.code);
     return { ok: true };
+  }
+
+  useRadarToken(
+    socketId: string
+  ):
+    | { ok: true; roomCode: string; playerId: string }
+    | { ok: false; error: string } {
+    const ctx = this.getSessionRoom(socketId);
+    if (!ctx) return { ok: false, error: 'Not in a room.' };
+    const { room, player } = ctx;
+
+    if (room.phase !== 'ACTIVE') {
+      return { ok: false, error: 'Radar Token can only be used once the hunt starts.' };
+    }
+    if (player.role !== 'RUNNER' || player.status !== 'ALIVE') {
+      return { ok: false, error: 'Only an alive runner can use this token.' };
+    }
+    if (!player.radarToken || !player.radarToken.available) {
+      return { ok: false, error: 'No available Radar Token.' };
+    }
+
+    const revealedHunters: HunterRadarSpot[] = [];
+    for (const p of room.players) {
+      if (p.role === 'HUNTER' && p.lastLocation) {
+        revealedHunters.push({
+          hunterId: p.id,
+          hunterName: p.name,
+          lat: p.lastLocation.lat,
+          lng: p.lastLocation.lng,
+          accuracy: p.lastLocation.accuracy,
+          recordedAt: p.lastLocation.timestamp,
+        });
+      }
+    }
+
+    // Consume 1-time token silently: no room broadcast, no match event, no hunter notification
+    player.radarToken = {
+      available: false,
+      usedAt: Date.now(),
+      revealedHunters,
+    };
+    room.lastActivityAt = Date.now();
+
+    return { ok: true, roomCode: room.code, playerId: player.id };
   }
 
   private eliminatePlayer(
@@ -1203,6 +1271,7 @@ export class GameManager {
       videoPings: room.videoPings,
       gpsPings: room.gpsPings,
       events: room.events,
+      myRadarToken: viewer?.radarToken,
     };
   }
 

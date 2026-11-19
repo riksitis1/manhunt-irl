@@ -38,7 +38,11 @@ export function emitAck<TPayload, TResult = undefined>(
     const timer = window.setTimeout(() => {
       if (!settled) {
         settled = true;
-        resolve({ ok: false, error: 'Connection timed out. Check signal and try again.' });
+        resolve({
+          ok: false,
+          error: 'Connection timed out. Check signal and try again.',
+          errorCode: 'NETWORK_TIMEOUT',
+        });
       }
     }, 10_000);
 

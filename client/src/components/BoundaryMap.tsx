@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { Crosshair, Maximize2, RotateCcw, Trash2 } from 'lucide-react';
-import type { Boundary, GeoPoint, GpsPingItem, LatLng, PublicPlayer } from '@shared/types';
-import { formatTimeAgo } from '../lib/geo';
+import { Crosshair, Maximize2, RotateCcw, Square, Trash2 } from 'lucide-react';
+import type {
+  Boundary,
+  GeoPoint,
+  GpsPingItem,
+  HunterRadarSpot,
+  LatLng,
+  PublicPlayer,
+} from '@shared/types';
+import { formatTimeAgo, haversineMeters } from '../lib/geo';
 
 interface BoundaryMapProps {
   boundary: Boundary;
@@ -13,26 +20,63 @@ interface BoundaryMapProps {
   isOutOfBounds?: boolean;
   hunters?: PublicPlayer[];
   gpsPings?: GpsPingItem[];
+  radarSpots?: HunterRadarSpot[];
   nowMs?: number;
   heightClass?: string;
 }
 
 const DEFAULT_CENTER: [number, number] = [40.7128, -74.006];
 
+function escapeHtml(raw: string): string {
+  return raw.replace(/[<>&"']/g, '');
+}
+
 function createLabelIcon(label: string, colorClass: string, sub?: string): L.DivIcon {
-  const safeLabel = label.replace(/[<>&"']/g, '');
-  const safeSub = sub ? sub.replace(/[<>&"']/g, '') : '';
+  const safeLabel = escapeHtml(label);
+  const safeSub = sub ? escapeHtml(sub) : '';
   return L.divIcon({
     className: 'bg-transparent border-0',
     html: `<div style="transform:translate(-50%,-100%);display:flex;flex-direction:column;align-items:center;pointer-events:auto;">
-      <div style="padding:3px 7px;border-radius:8px;font-size:11px;font-weight:700;white-space:nowrap;border:1px solid rgba(255,255,255,0.2);box-shadow:0 4px 12px rgba(0,0,0,0.6);" class="${colorClass}">
-        ${safeLabel}${safeSub ? `<span style="opacity:0.75;font-weight:500;margin-left:4px;">${safeSub}</span>` : ''}
+      <div style="padding:3px 7px;border-radius:8px;font-size:11px;font-weight:700;white-space:nowrap;border:1px solid rgba(255,255,255,0.22);box-shadow:0 4px 12px rgba(0,0,0,0.65);" class="${colorClass}">
+        ${safeLabel}${safeSub ? `<span style="opacity:0.8;font-weight:500;margin-left:4px;">${safeSub}</span>` : ''}
       </div>
       <div style="width:10px;height:10px;border-radius:9999px;margin-top:3px;border:2px solid #fff;" class="${colorClass}"></div>
     </div>`,
     iconSize: [0, 0],
     iconAnchor: [0, 0],
   });
+}
+
+function createCornerHandleIcon(index: number): L.DivIcon {
+  const bg = index === 0 ? '#f59e0b' : '#10b981';
+  return L.divIcon({
+    className: 'bg-transparent border-0',
+    html: `<div style="width:28px;height:28px;border-radius:9999px;background:${bg};border:2.5px solid #ffffff;color:#06080d;font-size:12px;font-weight:900;display:flex;align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(0,0,0,0.65);cursor:grab;touch-action:none;">${index + 1}</div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+  });
+}
+
+function createCenterHandleIcon(): L.DivIcon {
+  return L.divIcon({
+    className: 'bg-transparent border-0',
+    html: `<div style="width:28px;height:28px;border-radius:9999px;background:#10b981;border:2.5px solid #ffffff;display:flex;align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(0,0,0,0.65);cursor:grab;touch-action:none;">
+      <div style="width:8px;height:8px;border-radius:9999px;background:#06080d;"></div>
+    </div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+  });
+}
+
+function buildBoxAround(center: LatLng, halfSizeMeters = 75): LatLng[] {
+  const dLat = halfSizeMeters / 111_320;
+  const dLng = halfSizeMeters / (111_320 * Math.max(0.2, Math.cos((center.lat * Math.PI) / 180)));
+  return [
+    { lat: center.lat + dLat, lng: center.lng - dLng },
+    { lat: center.lat + dLat, lng: center.lng + dLng },
+    { lat: center.lat - dLat, lng: center.lng + dLng },
+    { lat: center.lat - dLat, lng: center.lng - dLng },
+  ];
 }
 
 export function BoundaryMap({
@@ -43,6 +87,7 @@ export function BoundaryMap({
   isOutOfBounds = false,
   hunters = [],
   gpsPings = [],
+  radarSpots = [],
   nowMs = Date.now(),
   heightClass = 'h-72',
 }: BoundaryMapProps) {
@@ -51,6 +96,7 @@ export function BoundaryMap({
   const boundaryLayerRef = useRef<L.LayerGroup | null>(null);
   const liveLayerRef = useRef<L.LayerGroup | null>(null);
   const didAutoCenterRef = useRef(false);
+  const ignoreMapClickUntilRef = useRef(0);
 
   const [drawTool, setDrawTool] = useState<'POLYGON' | 'CIRCLE'>(
     boundary.type === 'CIRCLE' ? 'CIRCLE' : 'POLYGON'
@@ -63,7 +109,7 @@ export function BoundaryMap({
   );
   const [locating, setLocating] = useState(false);
 
-  // Sync draft points if host resets or boundary changes externally
+  // Keep local editor state in sync when boundary changes externally
   useEffect(() => {
     if (boundary.type === 'POLYGON') {
       setDraftPoints(boundary.points);
@@ -81,7 +127,7 @@ export function BoundaryMap({
   const onChangeRef = useRef(onChangeBoundary);
   onChangeRef.current = onChangeBoundary;
 
-  // Initialize map once
+  // Initialize Leaflet map once
   useEffect(() => {
     const el = containerRef.current;
     if (!el || mapRef.current) return;
@@ -90,6 +136,7 @@ export function BoundaryMap({
       center: DEFAULT_CENTER,
       zoom: 16,
       zoomControl: false,
+      doubleClickZoom: !editable,
       preferCanvas: true,
       attributionControl: true,
     });
@@ -105,7 +152,9 @@ export function BoundaryMap({
 
     if (editable) {
       map.on('click', (e: L.LeafletMouseEvent) => {
+        if (Date.now() < ignoreMapClickUntilRef.current) return;
         const pt: LatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
+
         if (drawToolRef.current === 'CIRCLE') {
           onChangeRef.current?.({
             type: 'CIRCLE',
@@ -114,7 +163,12 @@ export function BoundaryMap({
           });
         } else {
           setDraftPoints((prev) => {
-            const next = [...prev, pt].slice(0, 40);
+            // Prevent accidental double-tap duplicates within 3 meters
+            const last = prev[prev.length - 1];
+            if (last && haversineMeters(last, pt) < 3) {
+              return prev;
+            }
+            const next = [...prev, pt].slice(0, 30);
             if (next.length >= 3) {
               onChangeRef.current?.({ type: 'POLYGON', points: next });
             }
@@ -124,13 +178,19 @@ export function BoundaryMap({
       });
     }
 
-    // Ensure Leaflet measures container properly after layout
-    const resizeTimer = window.setTimeout(() => {
-      map.invalidateSize();
-    }, 150);
+    // ResizeObserver prevents blank/grey tile glitches on tab switch or orientation change
+    const observer = new ResizeObserver(() => {
+      map.invalidateSize({ animate: false });
+    });
+    observer.observe(el);
+
+    const initTimer = window.setTimeout(() => {
+      map.invalidateSize({ animate: false });
+    }, 180);
 
     return () => {
-      window.clearTimeout(resizeTimer);
+      window.clearTimeout(initTimer);
+      observer.disconnect();
       map.remove();
       mapRef.current = null;
       boundaryLayerRef.current = null;
@@ -143,12 +203,12 @@ export function BoundaryMap({
     if (!map) return;
     if (boundary.type === 'POLYGON' && boundary.points.length >= 3) {
       const bounds = L.latLngBounds(boundary.points.map((p) => [p.lat, p.lng] as [number, number]));
-      map.fitBounds(bounds, { padding: [28, 28], maxZoom: 18 });
+      map.fitBounds(bounds, { padding: [32, 32], maxZoom: 18 });
     } else if (boundary.type === 'CIRCLE') {
       const circle = L.circle([boundary.center.lat, boundary.center.lng], {
         radius: boundary.radiusMeters,
       });
-      map.fitBounds(circle.getBounds(), { padding: [28, 28], maxZoom: 18 });
+      map.fitBounds(circle.getBounds(), { padding: [32, 32], maxZoom: 18 });
     } else if (myLocation) {
       map.setView([myLocation.lat, myLocation.lng], 17);
     }
@@ -171,7 +231,7 @@ export function BoundaryMap({
     }
   }, [boundary, myLocation, fitToBoundary]);
 
-  // Render boundary shapes & editable corner vertices
+  // Render boundary shapes & draggable corner/center handles
   useEffect(() => {
     const layer = boundaryLayerRef.current;
     if (!layer) return;
@@ -180,62 +240,107 @@ export function BoundaryMap({
     const strokeColor = isOutOfBounds ? '#ef4444' : '#10b981';
     const fillColor = isOutOfBounds ? '#ef4444' : '#10b981';
 
-    if (boundary.type === 'CIRCLE') {
-      L.circle([boundary.center.lat, boundary.center.lng], {
+    if (boundary.type === 'CIRCLE' && (!editable || drawTool === 'CIRCLE')) {
+      const circleShape = L.circle([boundary.center.lat, boundary.center.lng], {
         radius: boundary.radiusMeters,
         color: strokeColor,
         weight: 2.5,
         fillColor,
-        fillOpacity: isOutOfBounds ? 0.22 : 0.12,
+        fillOpacity: isOutOfBounds ? 0.22 : 0.13,
         dashArray: isOutOfBounds ? '6 6' : undefined,
       }).addTo(layer);
 
       if (editable) {
-        L.circleMarker([boundary.center.lat, boundary.center.lng], {
-          radius: 6,
-          color: '#ffffff',
-          weight: 2,
-          fillColor: '#10b981',
-          fillOpacity: 1,
+        const handle = L.marker([boundary.center.lat, boundary.center.lng], {
+          icon: createCenterHandleIcon(),
+          draggable: true,
         }).addTo(layer);
-      }
-    } else {
-      const pts = editable && drawTool === 'POLYGON' ? draftPoints : boundary.type === 'POLYGON' ? boundary.points : [];
-      if (pts.length >= 3) {
-        L.polygon(
-          pts.map((p) => [p.lat, p.lng] as [number, number]),
-          {
-            color: strokeColor,
-            weight: 2.5,
-            fillColor,
-            fillOpacity: isOutOfBounds ? 0.22 : 0.12,
-            dashArray: isOutOfBounds ? '6 6' : undefined,
-          }
-        ).addTo(layer);
-      } else if (pts.length === 2) {
-        L.polyline(
-          pts.map((p) => [p.lat, p.lng] as [number, number]),
-          { color: '#10b981', weight: 2, dashArray: '5 5' }
-        ).addTo(layer);
-      }
 
-      if (editable && drawTool === 'POLYGON') {
-        pts.forEach((p, idx) => {
-          L.circleMarker([p.lat, p.lng], {
-            radius: 7,
-            color: '#ffffff',
-            weight: 2,
-            fillColor: idx === 0 ? '#f59e0b' : '#10b981',
-            fillOpacity: 1,
-          })
-            .bindTooltip(String(idx + 1), { permanent: false })
-            .addTo(layer);
+        handle.on('dragstart', () => {
+          ignoreMapClickUntilRef.current = Date.now() + 10_000;
+        });
+        handle.on('drag', () => {
+          const pos = handle.getLatLng();
+          circleShape.setLatLng(pos);
+        });
+        handle.on('dragend', () => {
+          ignoreMapClickUntilRef.current = Date.now() + 300;
+          const pos = handle.getLatLng();
+          onChangeRef.current?.({
+            type: 'CIRCLE',
+            center: { lat: pos.lat, lng: pos.lng },
+            radiusMeters: circleRadiusRef.current,
+          });
         });
       }
+      return;
+    }
+
+    const pts =
+      editable && drawTool === 'POLYGON'
+        ? draftPoints
+        : boundary.type === 'POLYGON'
+          ? boundary.points
+          : [];
+
+    let polyShape: L.Polygon | null = null;
+    let lineShape: L.Polyline | null = null;
+
+    if (pts.length >= 3) {
+      polyShape = L.polygon(
+        pts.map((p) => [p.lat, p.lng] as [number, number]),
+        {
+          color: strokeColor,
+          weight: 2.5,
+          fillColor,
+          fillOpacity: isOutOfBounds ? 0.22 : 0.13,
+          dashArray: isOutOfBounds ? '6 6' : undefined,
+        }
+      ).addTo(layer);
+    } else if (pts.length === 2) {
+      lineShape = L.polyline(
+        pts.map((p) => [p.lat, p.lng] as [number, number]),
+        { color: '#10b981', weight: 2, dashArray: '5 5' }
+      ).addTo(layer);
+    }
+
+    if (editable && drawTool === 'POLYGON') {
+      const livePoints = pts.map((p) => ({ ...p }));
+
+      livePoints.forEach((p, idx) => {
+        const marker = L.marker([p.lat, p.lng], {
+          icon: createCornerHandleIcon(idx),
+          draggable: true,
+        }).addTo(layer);
+
+        marker.on('dragstart', () => {
+          ignoreMapClickUntilRef.current = Date.now() + 10_000;
+        });
+
+        marker.on('drag', () => {
+          const pos = marker.getLatLng();
+          livePoints[idx] = { lat: pos.lat, lng: pos.lng };
+          const coords = livePoints.map((pt) => [pt.lat, pt.lng] as [number, number]);
+          if (polyShape) polyShape.setLatLngs(coords);
+          if (lineShape) lineShape.setLatLngs(coords);
+        });
+
+        marker.on('dragend', () => {
+          ignoreMapClickUntilRef.current = Date.now() + 300;
+          const pos = marker.getLatLng();
+          const updated = livePoints.map((pt, i) =>
+            i === idx ? { lat: pos.lat, lng: pos.lng } : pt
+          );
+          setDraftPoints(updated);
+          if (updated.length >= 3) {
+            onChangeRef.current?.({ type: 'POLYGON', points: updated });
+          }
+        });
+      });
     }
   }, [boundary, draftPoints, drawTool, editable, isOutOfBounds]);
 
-  // Render live GPS dots, hunter teammates, and runner GPS pings
+  // Render live GPS dots, hunter teammates, runner GPS pings, and secret hunter radar spots
   useEffect(() => {
     const layer = liveLayerRef.current;
     if (!layer) return;
@@ -260,7 +365,7 @@ export function BoundaryMap({
       }).addTo(layer);
     }
 
-    // Hunter teammates
+    // Hunter teammates (visible to hunters & spectators only)
     for (const h of hunters) {
       if (!h.hunterLocation) continue;
       L.marker([h.hunterLocation.lat, h.hunterLocation.lng], {
@@ -286,10 +391,34 @@ export function BoundaryMap({
       }).addTo(layer);
 
       L.marker([ping.lat, ping.lng], {
-        icon: createLabelIcon(ping.playerName, 'bg-red-600 text-white', formatTimeAgo(ping.createdAt, nowMs)),
+        icon: createLabelIcon(
+          ping.playerName,
+          'bg-red-600 text-white',
+          formatTimeAgo(ping.createdAt, nowMs)
+        ),
       }).addTo(layer);
     }
-  }, [myLocation, hunters, gpsPings, nowMs]);
+
+    // Private 1-time Secret Hunter Radar spots (ONLY shown to the runner who redeemed the token)
+    for (const spot of radarSpots) {
+      L.circle([spot.lat, spot.lng], {
+        radius: Math.max(15, Math.min(spot.accuracy, 75)),
+        color: '#a855f7',
+        weight: 2,
+        dashArray: '4 4',
+        fillColor: '#a855f7',
+        fillOpacity: 0.2,
+      }).addTo(layer);
+
+      L.marker([spot.lat, spot.lng], {
+        icon: createLabelIcon(
+          `Hunter: ${spot.hunterName}`,
+          'bg-violet-600 text-white',
+          formatTimeAgo(spot.recordedAt, nowMs)
+        ),
+      }).addTo(layer);
+    }
+  }, [myLocation, hunters, gpsPings, radarSpots, nowMs]);
 
   const handleLocateMe = () => {
     const map = mapRef.current;
@@ -319,6 +448,36 @@ export function BoundaryMap({
       },
       { enableHighAccuracy: true, timeout: 8000 }
     );
+  };
+
+  const handleDropBlockBox = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const c = map.getCenter();
+    const box = buildBoxAround({ lat: c.lat, lng: c.lng }, 75);
+    setDrawTool('POLYGON');
+    setDraftPoints(box);
+    onChangeBoundary?.({ type: 'POLYGON', points: box });
+  };
+
+  const handleSwitchTool = (tool: 'POLYGON' | 'CIRCLE') => {
+    setDrawTool(tool);
+    if (tool === 'CIRCLE') {
+      const map = mapRef.current;
+      if (boundary.type !== 'CIRCLE' && map) {
+        const c = map.getCenter();
+        onChangeBoundary?.({
+          type: 'CIRCLE',
+          center: { lat: c.lat, lng: c.lng },
+          radiusMeters: circleRadius,
+        });
+      }
+    } else if (boundary.type === 'CIRCLE') {
+      // Convert cleanly into a 4-corner draggable box around the same center
+      const box = buildBoxAround(boundary.center, Math.min(250, Math.round(boundary.radiusMeters * 0.8)));
+      setDraftPoints(box);
+      onChangeBoundary?.({ type: 'POLYGON', points: box });
+    }
   };
 
   const handleUndoPoint = () => {
@@ -353,32 +512,43 @@ export function BoundaryMap({
     <div className="overflow-hidden rounded-2xl border border-borderSubtle bg-surface">
       {editable && (
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-borderSubtle bg-surfaceElevated/60 px-3 py-2">
-          <div className="inline-flex rounded-lg bg-obsidian p-0.5 border border-borderSubtle">
+          <div className="inline-flex rounded-lg border border-borderSubtle bg-obsidian p-0.5">
             <button
               type="button"
-              onClick={() => setDrawTool('POLYGON')}
+              onClick={() => handleSwitchTool('POLYGON')}
               className={`rounded-md px-2.5 py-1 text-xs font-bold transition ${
                 drawTool === 'POLYGON'
                   ? 'bg-emerald-500 text-slate-950'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Block Polygon
+              Block Border
             </button>
             <button
               type="button"
-              onClick={() => setDrawTool('CIRCLE')}
+              onClick={() => handleSwitchTool('CIRCLE')}
               className={`rounded-md px-2.5 py-1 text-xs font-bold transition ${
                 drawTool === 'CIRCLE'
                   ? 'bg-emerald-500 text-slate-950'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              Quick Circle
+              Circle
             </button>
           </div>
 
           <div className="flex items-center gap-1.5">
+            {drawTool === 'POLYGON' && (
+              <button
+                type="button"
+                onClick={handleDropBlockBox}
+                className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-bold text-emerald-300 active:scale-95"
+                title="Drop a 4-corner draggable box on screen"
+              >
+                <Square className="h-3 w-3" />
+                Drop Box
+              </button>
+            )}
             {drawTool === 'POLYGON' && draftPoints.length > 0 && (
               <button
                 type="button"
@@ -451,11 +621,11 @@ export function BoundaryMap({
             <div className="inline-block rounded-lg border border-borderSubtle bg-obsidian/90 px-2.5 py-1 text-[11px] font-medium text-slate-300 backdrop-blur">
               {drawTool === 'POLYGON'
                 ? draftPoints.length < 3
-                  ? `Tap ${3 - draftPoints.length} more corner${3 - draftPoints.length > 1 ? 's' : ''} on the map around your block`
-                  : `Block boundary active (${draftPoints.length} corners)`
+                  ? `Tap map corners (${draftPoints.length}/3+) or tap "Drop Box" to drag 4 corners`
+                  : `Drag any numbered corner to adjust (${draftPoints.length} pts)`
                 : boundary.type === 'CIRCLE'
-                  ? `Circle boundary active (${boundary.radiusMeters}m radius)`
-                  : 'Tap map or My GPS button to place boundary center'}
+                  ? `Drag green center pin or slide radius (${boundary.radiusMeters}m)`
+                  : 'Tap map or My GPS button to place circle'}
             </div>
           </div>
         )}

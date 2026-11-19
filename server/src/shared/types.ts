@@ -32,7 +32,23 @@ export interface RoomSettings {
   videoMaxDurationSec: number;
   keepVideos: boolean;
   boundaryGraceSec: number;
+  hunterRadarToken: boolean;
   boundary: Boundary;
+}
+
+export interface HunterRadarSpot {
+  hunterId: string;
+  hunterName: string;
+  lat: number;
+  lng: number;
+  accuracy: number;
+  recordedAt: number;
+}
+
+export interface SecretRadarTokenState {
+  available: boolean;
+  usedAt?: number;
+  revealedHunters?: HunterRadarSpot[];
 }
 
 export interface GeoPoint {
@@ -137,6 +153,8 @@ export interface RoomSnapshot {
   videoPings: VideoPingItem[];
   gpsPings: GpsPingItem[];
   events: MatchEvent[];
+  /** Private: only populated for the single runner randomly granted the 1-time Hunter Radar Token. */
+  myRadarToken?: SecretRadarTokenState;
 }
 
 export interface JoinSuccessPayload {
@@ -148,6 +166,7 @@ export interface JoinSuccessPayload {
 export interface SocketAck<T = undefined> {
   ok: boolean;
   error?: string;
+  errorCode?: 'SESSION_EXPIRED' | 'NETWORK_TIMEOUT' | 'BAD_REQUEST';
   data?: T;
 }
 
@@ -161,5 +180,6 @@ export const DEFAULT_ROOM_SETTINGS: RoomSettings = {
   videoMaxDurationSec: 10,
   keepVideos: true,
   boundaryGraceSec: 10,
+  hunterRadarToken: false,
   boundary: { type: 'NONE' },
 };

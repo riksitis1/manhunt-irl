@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import {
+  Bell,
   Check,
   Copy,
   Crown,
+  Eye,
   LogOut,
   MapPin,
   Minus,
@@ -16,6 +18,11 @@ import {
 } from 'lucide-react';
 import type { RoomSettings, RoomSnapshot } from '@shared/types';
 import { BoundaryMap } from '../components/BoundaryMap';
+import {
+  getNotificationPermission,
+  requestNotificationPermission,
+  unlockAudio,
+} from '../lib/alerts';
 import { formatDurationShort } from '../lib/geo';
 
 interface LobbyViewProps {
@@ -44,6 +51,12 @@ export function LobbyView({
   const me = room.players.find((p) => p.id === room.meId);
   const isHost = Boolean(me?.isHost);
   const [copiedType, setCopiedType] = useState<'CODE' | 'LINK' | null>(null);
+  const [notifPerm, setNotifPerm] = useState(() => getNotificationPermission());
+
+  const handleEnableAlerts = async () => {
+    const res = await requestNotificationPermission();
+    setNotifPerm(res);
+  };
 
   const shareUrl = `${window.location.origin}/?join=${room.code}`;
   const { settings } = room;
@@ -87,14 +100,26 @@ export function LobbyView({
           </p>
           <h2 className="text-lg font-black text-white">Pre-Game Setup</h2>
         </div>
-        <button
-          type="button"
-          onClick={onLeave}
-          className="inline-flex items-center gap-1.5 rounded-xl border border-borderSubtle bg-surface px-3 py-2 text-xs font-bold text-slate-300 active:scale-95"
-        >
-          <LogOut className="h-3.5 w-3.5" />
-          Leave
-        </button>
+        <div className="flex items-center gap-2">
+          {notifPerm !== 'granted' && notifPerm !== 'unsupported' && (
+            <button
+              type="button"
+              onClick={() => void handleEnableAlerts()}
+              className="inline-flex items-center gap-1 rounded-xl border border-amber-500/40 bg-amber-500/15 px-2.5 py-2 text-xs font-bold text-amber-300 active:scale-95"
+            >
+              <Bell className="h-3.5 w-3.5" />
+              Alerts
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onLeave}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-borderSubtle bg-surface px-3 py-2 text-xs font-bold text-slate-300 active:scale-95"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Leave
+          </button>
+        </div>
       </div>
 
       {/* Join Code Hero */}
@@ -450,7 +475,7 @@ export function LobbyView({
         )}
 
         {/* Boundary Grace Period */}
-        <div>
+        <div className="mb-3.5">
           <div className="mb-1.5 flex items-center justify-between">
             <span className="text-[11px] font-semibold text-slate-400">
               Border GPS Drift Grace
@@ -476,6 +501,37 @@ export function LobbyView({
               </button>
             ))}
           </div>
+        </div>
+
+        {/* Secret 1-Time Hunter Radar Token */}
+        <div className="flex items-center justify-between gap-3 rounded-2xl border border-violet-500/30 bg-violet-500/10 p-3">
+          <div className="flex items-start gap-2.5">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-500/20 text-violet-300">
+              <Eye className="h-4 w-4" />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-white">Secret Hunter Radar Token</p>
+              <p className="text-[10px] leading-snug text-violet-200/80">
+                1 random runner secretly gets a 1-time scan of hunters&apos; last GPS spots. Only
+                they see it — hunters are never notified.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={!isHost}
+            onClick={() => onUpdateSettings({ hunterRadarToken: !settings.hunterRadarToken })}
+            className={`relative h-7 w-12 shrink-0 rounded-full transition ${
+              settings.hunterRadarToken ? 'bg-violet-500' : 'bg-slate-700'
+            } disabled:opacity-70`}
+            aria-label="Toggle secret hunter radar token"
+          >
+            <span
+              className={`absolute top-1 h-5 w-5 rounded-full bg-white transition ${
+                settings.hunterRadarToken ? 'left-6' : 'left-1'
+              }`}
+            />
+          </button>
         </div>
       </div>
 
@@ -522,7 +578,10 @@ export function LobbyView({
             <button
               type="button"
               disabled={!canStart}
-              onClick={onStartGame}
+              onClick={() => {
+                unlockAudio();
+                onStartGame();
+              }}
               className="flex w-full items-center justify-center gap-2 rounded-2xl bg-red-500 py-4 text-sm font-black uppercase tracking-wide text-white shadow-[0_6px_24px_rgba(239,68,68,0.35)] transition active:scale-[0.98] disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none"
             >
               <Play className="h-4 w-4 fill-current" />

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { GeoPoint, JoinSuccessPayload, RoomSettings, RoomSnapshot } from '@shared/types';
+import { unlockAudio } from './lib/alerts';
 import {
   clearSession,
   emitAck,
@@ -29,6 +30,7 @@ export function App() {
 
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const reconnectingRef = useRef(false);
 
   const initialJoinCode = getJoinCodeFromUrl();
 
@@ -37,13 +39,22 @@ export function App() {
 
     const tryReconnect = () => {
       const saved = sessionRef.current;
-      if (!saved) return;
+      if (!saved || reconnectingRef.current) return;
+      if (!socket.connected) {
+        socket.connect();
+        return;
+      }
+
+      reconnectingRef.current = true;
       void emitAck('room:reconnect', {
         roomCode: saved.roomCode,
         playerId: saved.playerId,
         sessionToken: saved.sessionToken,
       }).then((res) => {
-        if (!res.ok) {
+        reconnectingRef.current = false;
+        // ONLY clear session when the server explicitly confirms the lobby/session is gone.
+        // Never kick players out on transient mobile network timeouts after phone lock!
+        if (!res.ok && res.errorCode === 'SESSION_EXPIRED') {
           clearSession();
           setSession(null);
           setRoom(null);
@@ -73,24 +84,61 @@ export function App() {
       setError(payload?.reason ?? 'You were removed from the lobby.');
     };
 
+    // Seamless wake-up sync when a player unlocks their phone or switches back to browser
+    const onWakeUp = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!sessionRef.current) return;
+      if (!socket.connected) {
+        socket.connect();
+      } else {
+        tryReconnect();
+      }
+    };
+
+    const onOnline = () => {
+      if (!sessionRef.current) return;
+      if (!socket.connected) {
+        socket.connect();
+      } else {
+        tryReconnect();
+      }
+    };
+
+    // Gentle retry if a session exists on disk but we haven't received room state yet
+    const retryInterval = window.setInterval(() => {
+      if (document.visibilityState === 'visible' && sessionRef.current) {
+        if (!socket.connected) {
+          socket.connect();
+        }
+      }
+    }, 4000);
+
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
     socket.on('room:state', onRoomState);
     socket.on('room:kicked', onKicked);
+    document.addEventListener('visibilitychange', onWakeUp);
+    window.addEventListener('pageshow', onWakeUp);
+    window.addEventListener('online', onOnline);
 
     if (socket.connected) {
       tryReconnect();
     }
 
     return () => {
+      window.clearInterval(retryInterval);
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
       socket.off('room:state', onRoomState);
       socket.off('room:kicked', onKicked);
+      document.removeEventListener('visibilitychange', onWakeUp);
+      window.removeEventListener('pageshow', onWakeUp);
+      window.removeEventListener('online', onOnline);
     };
   }, []);
 
   const handleCreateLobby = async (name: string) => {
+    unlockAudio();
     setBusy(true);
     setError(null);
     const res = await emitAck<{ name: string }, JoinSuccessPayload>('room:create', { name });
@@ -109,6 +157,7 @@ export function App() {
   };
 
   const handleJoinLobby = async (code: string, name: string) => {
+    unlockAudio();
     setBusy(true);
     setError(null);
     const res = await emitAck<{ code: string; name: string }, JoinSuccessPayload>('room:join', {
@@ -127,7 +176,6 @@ export function App() {
     };
     saveSession(nextSession);
     setSession(nextSession);
-    // Clean ?join= query param after joining
     if (window.location.search.includes('join=')) {
       window.history.replaceState({}, '', window.location.pathname);
     }
@@ -197,6 +245,11 @@ export function App() {
     void emitAck('game:resetLobby', {});
   };
 
+  const handleUseRadarToken = async (): Promise<{ ok: boolean; error?: string }> => {
+    const res = await emitAck('game:useRadarToken', {});
+    return { ok: res.ok, error: res.error };
+  };
+
   return (
     <div className="h-full w-full overflow-y-auto bg-obsidian text-slate-100">
       {!connected && (
@@ -242,6 +295,7 @@ export function App() {
           onRespondTag={handleRespondTag}
           onHostEliminate={handleHostEliminate}
           onEndGame={handleEndGame}
+          onUseRadarToken={handleUseRadarToken}
         />
       )}
 

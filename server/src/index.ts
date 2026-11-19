@@ -205,7 +205,7 @@ io.on('connection', (socket) => {
         payload?.sessionToken ?? ''
       );
       if (!res.ok) {
-        ack?.({ ok: false, error: res.error });
+        ack?.({ ok: false, error: res.error, errorCode: res.errorCode });
         return;
       }
       ack?.({ ok: true });
@@ -288,6 +288,20 @@ io.on('connection', (socket) => {
 
   socket.on('game:resetLobby', (_payload: unknown, ack?: (res: SocketAck) => void) => {
     ack?.(gameManager.resetToLobby(socket.id));
+  });
+
+  socket.on('game:useRadarToken', (_payload: unknown, ack?: (res: SocketAck) => void) => {
+    const res = gameManager.useRadarToken(socket.id);
+    if (!res.ok) {
+      ack?.({ ok: false, error: res.error });
+      return;
+    }
+    // Emit updated snapshot ONLY to this runner so hunters receive zero signal
+    const privateSnap = gameManager.buildSnapshotFor(res.roomCode, res.playerId);
+    if (privateSnap) {
+      socket.emit('room:state', privateSnap);
+    }
+    ack?.({ ok: true });
   });
 
   socket.on('disconnect', () => {

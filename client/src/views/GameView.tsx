@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BatteryCharging,
+  Bell,
   Camera,
   Check,
   Crosshair,
+  Eye,
   Flag,
   Map as MapIcon,
   MapPin,
@@ -21,7 +23,12 @@ import { LiveVideoRecorder } from '../components/LiveVideoRecorder';
 import { VideoCard } from '../components/VideoCard';
 import { useAdaptiveGps } from '../hooks/useAdaptiveGps';
 import { useWakeLock } from '../hooks/useWakeLock';
-import { formatCountdown, formatTimeAgo, vibrate } from '../lib/geo';
+import {
+  getNotificationPermission,
+  requestNotificationPermission,
+  triggerSystemAlert,
+} from '../lib/alerts';
+import { formatCountdown, formatTimeAgo } from '../lib/geo';
 
 interface GameViewProps {
   room: RoomSnapshot;
@@ -33,9 +40,17 @@ interface GameViewProps {
   onRespondTag: (accept: boolean) => void;
   onHostEliminate: (targetPlayerId: string) => void;
   onEndGame: () => void;
+  onUseRadarToken: () => Promise<{ ok: boolean; error?: string }>;
 }
 
 type TabId = 'MAP' | 'INTEL' | 'SQUAD';
+
+interface ToastBanner {
+  id: number;
+  title: string;
+  body: string;
+  variant: 'danger' | 'warn' | 'radar' | 'info';
+}
 
 export function GameView({
   room,
@@ -47,14 +62,41 @@ export function GameView({
   onRespondTag,
   onHostEliminate,
   onEndGame,
+  onUseRadarToken,
 }: GameViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>('MAP');
   const [batterySaver, setBatterySaver] = useState(false);
   const [recorderOpen, setRecorderOpen] = useState(false);
   const [confirmSelfCaught, setConfirmSelfCaught] = useState(false);
   const [confirmEndGame, setConfirmEndGame] = useState(false);
+  const [confirmRadar, setConfirmRadar] = useState(false);
+  const [radarBusy, setRadarBusy] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now() + clockOffsetMs);
   const [seenIntelCount, setSeenIntelCount] = useState(0);
+  const [toast, setToast] = useState<ToastBanner | null>(null);
+  const [notifPerm, setNotifPerm] = useState(() => getNotificationPermission());
+
+  const toastTimerRef = useRef<number | null>(null);
+
+  const showToast = useCallback(
+    (title: string, body: string, variant: ToastBanner['variant']) => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+      setToast({ id: Date.now(), title, body, variant });
+      toastTimerRef.current = window.setTimeout(() => {
+        setToast(null);
+        toastTimerRef.current = null;
+      }, 5500);
+    },
+    []
+  );
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   const me = room.players.find((p) => p.id === room.meId);
   const isHost = Boolean(me?.isHost);
@@ -100,33 +142,161 @@ export function GameView({
     onFix: handleGpsFix,
   });
 
-  // Haptic alerts on phase change, video ping due, or boundary breach
+  // Alert state trackers (initialized from current snapshot so reconnects don't replay stale alerts)
   const prevPhaseRef = useRef(room.phase);
-  const prevPingRoundRef = useRef<number>(0);
-  const prevOobRef = useRef<boolean>(false);
+  const prevVideoPingRoundRef = useRef<number>(me?.pendingPing?.round ?? 0);
+  const prevOobRef = useRef<boolean>(me?.outOfBoundsSince !== undefined);
+  const prevLatestGpsPingIdRef = useRef<string | null>(room.gpsPings[0]?.id ?? null);
+  const prevMyGpsPingCountRef = useRef<number>(
+    room.gpsPings.filter((p) => p.playerId === room.meId).length
+  );
+  const prevLatestVideoIdRef = useRef<string | null>(room.videoPings[0]?.id ?? null);
+  const prevEliminatedCountRef = useRef<number>(
+    room.players.filter((p) => p.status === 'ELIMINATED').length
+  );
 
+  // 1. Headstart -> Active hunt release alert
   useEffect(() => {
     if (prevPhaseRef.current === 'HEADSTART' && room.phase === 'ACTIVE') {
-      vibrate([120, 60, 120, 60, 200]);
+      const title = isHunter ? 'HEADSTART OVER — HUNT!' : 'HUNTERS RELEASED!';
+      const body = isHunter
+        ? 'The chase is live. Track down the runners!'
+        : 'Hunters are moving. Stay inside the block border!';
+      showToast(title, body, 'danger');
+      triggerSystemAlert({
+        title,
+        body,
+        tone: 'phase',
+        vibratePattern: [120, 60, 120, 60, 200],
+        tag: 'manhunt-phase',
+      });
     }
     prevPhaseRef.current = room.phase;
-  }, [room.phase]);
+  }, [room.phase, isHunter, showToast]);
 
+  // 2. Video ping due alert for runner
   useEffect(() => {
     const round = me?.pendingPing?.round ?? 0;
-    if (round > 0 && round !== prevPingRoundRef.current && room.settings.mode === 'VIDEO') {
-      vibrate([180, 80, 180]);
+    if (
+      round > 0 &&
+      round !== prevVideoPingRoundRef.current &&
+      room.settings.mode === 'VIDEO' &&
+      isRunner &&
+      isAlive
+    ) {
+      const title = `360° VIDEO PING #${round} DUE`;
+      const body = `Record live surroundings before the deadline or you are eliminated!`;
+      showToast(title, body, 'warn');
+      triggerSystemAlert({
+        title,
+        body,
+        tone: 'urgent',
+        vibratePattern: [200, 80, 200, 80, 200],
+        tag: `manhunt-video-due-${round}`,
+      });
     }
-    prevPingRoundRef.current = round;
-  }, [me?.pendingPing?.round, room.settings.mode]);
+    prevVideoPingRoundRef.current = round;
+  }, [me?.pendingPing?.round, room.settings.mode, isRunner, isAlive, showToast]);
 
+  // 3. Location revealed alert in GPS mode (runner notified when THEIR location drops; hunters notified when ANY spot drops)
+  useEffect(() => {
+    const myGpsCount = room.gpsPings.filter((p) => p.playerId === room.meId).length;
+    const latestPing = room.gpsPings[0];
+
+    if (isRunner && myGpsCount > prevMyGpsPingCountRef.current) {
+      const title = 'YOUR LOCATION WAS REVEALED!';
+      const body = `Ping #${room.pingRound}: Your last GPS spot is now visible on the hunters' map. Move!`;
+      showToast(title, body, 'danger');
+      triggerSystemAlert({
+        title,
+        body,
+        tone: 'reveal',
+        vibratePattern: [180, 70, 240],
+        tag: `manhunt-loc-revealed-${room.pingRound}`,
+      });
+    } else if (
+      isHunter &&
+      latestPing &&
+      latestPing.id !== prevLatestGpsPingIdRef.current
+    ) {
+      const title = 'RUNNER LOCATION REVEALED!';
+      const body = `${latestPing.playerName}'s GPS spot dropped on your map.`;
+      showToast(title, body, 'info');
+      triggerSystemAlert({
+        title,
+        body,
+        tone: 'reveal',
+        vibratePattern: [120, 60, 120],
+        tag: `manhunt-gps-hunter-${latestPing.round}`,
+      });
+    }
+
+    prevMyGpsPingCountRef.current = myGpsCount;
+    prevLatestGpsPingIdRef.current = latestPing?.id ?? null;
+  }, [room.gpsPings, room.meId, room.pingRound, isRunner, isHunter, showToast]);
+
+  // 4. New 360 video received alert for hunters (and runner confirmation)
+  useEffect(() => {
+    const latestVideo = room.videoPings[0];
+    if (latestVideo && latestVideo.id !== prevLatestVideoIdRef.current) {
+      if (latestVideo.playerId === room.meId) {
+        showToast(
+          '360° VIDEO SENT',
+          'Hunters can now analyze your surroundings — relocate!',
+          'warn'
+        );
+      } else if (isHunter) {
+        const title = `NEW 360° VIDEO: ${latestVideo.playerName}`;
+        const body = `Ping #${latestVideo.round} arrived in the Intel tab.`;
+        showToast(title, body, 'info');
+        triggerSystemAlert({
+          title,
+          body,
+          tone: 'reveal',
+          vibratePattern: [140, 60, 140],
+          tag: `manhunt-vid-${latestVideo.id}`,
+        });
+      }
+    }
+    prevLatestVideoIdRef.current = latestVideo?.id ?? null;
+  }, [room.videoPings, room.meId, isHunter, showToast]);
+
+  // 5. Out-of-bounds warning alert
   useEffect(() => {
     const isOob = me?.outOfBoundsSince !== undefined;
     if (isOob && !prevOobRef.current) {
-      vibrate([250, 100, 250]);
+      const title = 'OUT OF BOUNDS!';
+      const body = 'Step back inside the green block border immediately!';
+      showToast(title, body, 'danger');
+      triggerSystemAlert({
+        title,
+        body,
+        tone: 'urgent',
+        vibratePattern: [280, 90, 280],
+        tag: 'manhunt-oob',
+      });
     }
     prevOobRef.current = isOob;
-  }, [me?.outOfBoundsSince]);
+  }, [me?.outOfBoundsSince, showToast]);
+
+  // 6. Elimination alert
+  useEffect(() => {
+    const elimCount = room.players.filter((p) => p.status === 'ELIMINATED').length;
+    if (elimCount > prevEliminatedCountRef.current) {
+      const latestEv = room.events.find((e) => e.type === 'ELIMINATION');
+      if (latestEv) {
+        showToast('ELIMINATION', latestEv.message, 'danger');
+        triggerSystemAlert({
+          title: 'Runner Eliminated',
+          body: latestEv.message,
+          tone: 'elimination',
+          vibratePattern: [100, 50, 200],
+          tag: `manhunt-elim-${elimCount}`,
+        });
+      }
+    }
+    prevEliminatedCountRef.current = elimCount;
+  }, [room.players, room.events, showToast]);
 
   // Unread intel badge tracking
   const totalIntel =
@@ -175,6 +345,40 @@ export function GameView({
     isAlive &&
     me?.pendingPing !== undefined;
 
+  const radarToken = room.myRadarToken;
+  const radarSpots = radarToken?.revealedHunters ?? [];
+
+  const handleActivateRadar = async () => {
+    setRadarBusy(true);
+    const res = await onUseRadarToken();
+    setRadarBusy(false);
+    setConfirmRadar(false);
+    if (!res.ok) {
+      showToast('Radar Scan Unavailable', res.error ?? 'Unable to activate token.', 'warn');
+      return;
+    }
+    setActiveTab('MAP');
+    showToast(
+      'SILENT RADAR ACTIVATED',
+      'Hunters’ last GPS spots are pinned in purple on YOUR map only. Hunters were NOT notified.',
+      'radar'
+    );
+    triggerSystemAlert({
+      title: 'Silent Radar Active',
+      body: 'Hunters’ last spots are now visible on your map only.',
+      tone: 'radar',
+      vibratePattern: [40, 40, 80],
+    });
+  };
+
+  const handleEnableNotifications = async () => {
+    const perm = await requestNotificationPermission();
+    setNotifPerm(perm);
+    if (perm === 'granted') {
+      showToast('Alerts Enabled', 'Sound + system alerts active for pings & reveals.', 'info');
+    }
+  };
+
   const roleBadgeClass = !isAlive
     ? 'border-slate-600 bg-slate-800 text-slate-300'
     : isHunter
@@ -199,7 +403,18 @@ export function GameView({
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            {notifPerm !== 'granted' && notifPerm !== 'unsupported' && (
+              <button
+                type="button"
+                onClick={() => void handleEnableNotifications()}
+                className="flex h-7 w-7 items-center justify-center rounded-lg border border-amber-500/40 bg-amber-500/15 text-amber-300"
+                title="Enable alerts"
+              >
+                <Bell className="h-3.5 w-3.5" />
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => setBatterySaver((v) => !v)}
@@ -211,7 +426,7 @@ export function GameView({
               title="Toggle Battery Saver (reduces GPS polling & releases screen wake lock)"
             >
               <BatteryCharging className="h-3.5 w-3.5" />
-              {batterySaver ? 'Eco ON' : isAwake ? 'Awake' : 'Eco'}
+              {batterySaver ? 'Eco' : isAwake ? 'Awake' : 'Eco'}
             </button>
 
             <div className="rounded-lg border border-borderSubtle bg-obsidian px-2.5 py-1 text-right">
@@ -229,6 +444,36 @@ export function GameView({
           </div>
         </div>
       </header>
+
+      {/* Live Toast Alert Banner */}
+      {toast && (
+        <div className="shrink-0 px-3 pt-2">
+          <div
+            className={`flex items-start justify-between gap-2 rounded-2xl border px-3.5 py-2.5 shadow-lg ${
+              toast.variant === 'danger'
+                ? 'border-red-500/70 bg-red-500/20 text-red-100'
+                : toast.variant === 'warn'
+                  ? 'border-amber-500/70 bg-amber-500/20 text-amber-100'
+                  : toast.variant === 'radar'
+                    ? 'border-violet-500/70 bg-violet-500/20 text-violet-100'
+                    : 'border-emerald-500/50 bg-emerald-500/15 text-emerald-100'
+            }`}
+          >
+            <div className="min-w-0">
+              <p className="text-xs font-black uppercase tracking-wide">{toast.title}</p>
+              <p className="mt-0.5 text-[11px] leading-snug opacity-90">{toast.body}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className="shrink-0 rounded-lg p-1 opacity-70 hover:opacity-100"
+              aria-label="Dismiss notification"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Urgent Action Banners */}
       <div className="shrink-0 space-y-2 px-3 pt-2 empty:hidden">
@@ -357,6 +602,79 @@ export function GameView({
               </div>
             )}
 
+            {/* Secret 1-Time Hunter Radar Token (ONLY rendered for the single lucky runner) */}
+            {radarToken && isRunner && isAlive && (
+              <div className="rounded-2xl border border-violet-500/50 bg-gradient-to-r from-violet-500/20 via-surface to-surface p-3">
+                {radarToken.available ? (
+                  !confirmRadar ? (
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-violet-500/25 text-violet-300">
+                          <Eye className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-xs font-black uppercase tracking-wide text-violet-200">
+                            Secret Radar Token (1-Time)
+                          </p>
+                          <p className="text-[11px] leading-snug text-violet-200/80">
+                            Only YOU have this. Reveals hunters&apos; last GPS spot silently.
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isHeadstart}
+                        onClick={() => setConfirmRadar(true)}
+                        className="shrink-0 rounded-xl bg-violet-500 px-3 py-2 text-xs font-black text-white shadow active:scale-95 disabled:bg-slate-700 disabled:text-slate-400"
+                      >
+                        {isHeadstart ? 'Locked' : 'Use'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-2 text-center">
+                      <p className="text-xs font-bold text-violet-100">
+                        Use your 1-time secret scan now? Hunters will NOT be notified.
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          disabled={radarBusy}
+                          onClick={() => setConfirmRadar(false)}
+                          className="rounded-xl border border-borderSubtle bg-obsidian py-2 text-xs font-bold text-slate-300"
+                        >
+                          Save For Later
+                        </button>
+                        <button
+                          type="button"
+                          disabled={radarBusy}
+                          onClick={() => void handleActivateRadar()}
+                          className="rounded-xl bg-violet-500 py-2 text-xs font-black text-white"
+                        >
+                          {radarBusy ? 'Scanning...' : 'Scan Hunters Now'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                ) : (
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-2 text-violet-200">
+                      <Eye className="h-4 w-4 text-violet-400" />
+                      <span className="font-bold">
+                        {radarSpots.length > 0
+                          ? `Silent Scan Used · ${radarSpots.length} hunter spot${radarSpots.length > 1 ? 's' : ''} pinned in purple`
+                          : 'Silent Scan Used · No hunter GPS fix recorded yet'}
+                      </span>
+                    </div>
+                    {radarToken.usedAt && (
+                      <span className="shrink-0 font-mono text-[10px] text-violet-300/75">
+                        {formatTimeAgo(radarToken.usedAt, nowMs)}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             <BoundaryMap
               boundary={room.settings.boundary}
               editable={false}
@@ -364,8 +682,9 @@ export function GameView({
               isOutOfBounds={me?.outOfBoundsSince !== undefined || !gps.insideBoundary}
               hunters={isHunter || !isAlive ? hunters.filter((h) => h.id !== room.meId) : []}
               gpsPings={room.settings.mode === 'GPS' ? room.gpsPings : []}
+              radarSpots={radarSpots}
               nowMs={nowMs}
-              heightClass="h-[52vh] min-h-[290px]"
+              heightClass="h-[50vh] min-h-[280px]"
             />
 
             {/* Compact GPS & Border Status Bar */}
@@ -617,7 +936,9 @@ export function GameView({
                         {p.id === room.meId ? ' (You)' : ''}
                       </span>
                     </div>
-                    <span className="text-[11px] font-bold uppercase text-red-400">Hunting</span>
+                    <span className="text-[11px] font-bold uppercase text-red-400">
+                      {p.connected ? 'Hunting' : 'Phone Locked'}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -646,7 +967,9 @@ export function GameView({
                               ? 'bg-slate-600'
                               : p.outOfBoundsSince
                                 ? 'bg-red-500 animate-ping'
-                                : 'bg-emerald-400'
+                                : p.connected
+                                  ? 'bg-emerald-400'
+                                  : 'bg-amber-400'
                           }`}
                         />
                         <span className="truncate text-sm font-bold text-white">
@@ -667,7 +990,9 @@ export function GameView({
                             ? room.settings.mode === 'VIDEO'
                               ? `Video due (${formatCountdown(p.pendingPing.deadlineAt - nowMs)})`
                               : 'GPS ping pending...'
-                            : 'Active'}
+                            : p.connected
+                              ? 'Active'
+                              : 'Phone locked (still in game)'}
                       </p>
                     </div>
 
