@@ -11,15 +11,23 @@ import {
   Map as MapIcon,
   MapPin,
   Radio,
+  RefreshCw,
   ShieldAlert,
+  ShieldCheck,
   Skull,
   Users,
   Video,
   X,
 } from 'lucide-react';
-import type { GeoPoint, RoomSnapshot } from '@shared/types';
+import type {
+  GeoPoint,
+  RadioActivityPayload,
+  RadioIncomingPayload,
+  RoomSnapshot,
+} from '@shared/types';
 import { BoundaryMap } from '../components/BoundaryMap';
 import { LiveVideoRecorder } from '../components/LiveVideoRecorder';
+import { RadioPanel } from '../components/RadioPanel';
 import { VideoCard } from '../components/VideoCard';
 import { useAdaptiveGps } from '../hooks/useAdaptiveGps';
 import { useWakeLock } from '../hooks/useWakeLock';
@@ -29,6 +37,8 @@ import {
   triggerSystemAlert,
 } from '../lib/alerts';
 import { formatCountdown, formatTimeAgo } from '../lib/geo';
+import { playIncomingRadioClip } from '../lib/radioAudio';
+import { getSocket } from '../lib/socket';
 
 interface GameViewProps {
   room: RoomSnapshot;
@@ -41,9 +51,13 @@ interface GameViewProps {
   onHostEliminate: (targetPlayerId: string) => void;
   onEndGame: () => void;
   onUseRadarToken: () => Promise<{ ok: boolean; error?: string }>;
+  onSetRadioChannel: (channel: number) => void;
+  onRadioTxStart: () => void;
+  onRadioTxEnd: () => void;
+  onRadioTransmit: (audio: ArrayBuffer, mimeType: string, durationMs: number) => Promise<void>;
 }
 
-type TabId = 'MAP' | 'INTEL' | 'SQUAD';
+type TabId = 'MAP' | 'INTEL' | 'RADIO' | 'SQUAD';
 
 interface ToastBanner {
   id: number;
@@ -63,11 +77,15 @@ export function GameView({
   onHostEliminate,
   onEndGame,
   onUseRadarToken,
+  onSetRadioChannel,
+  onRadioTxStart,
+  onRadioTxEnd,
+  onRadioTransmit,
 }: GameViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>('MAP');
   const [batterySaver, setBatterySaver] = useState(false);
   const [recorderOpen, setRecorderOpen] = useState(false);
-  const [confirmSelfCaught, setConfirmSelfCaught] = useState(false);
+  const [caughtModalOpen, setCaughtModalOpen] = useState(false);
   const [confirmEndGame, setConfirmEndGame] = useState(false);
   const [confirmRadar, setConfirmRadar] = useState(false);
   const [radarBusy, setRadarBusy] = useState(false);
@@ -75,6 +93,24 @@ export function GameView({
   const [seenIntelCount, setSeenIntelCount] = useState(0);
   const [toast, setToast] = useState<ToastBanner | null>(null);
   const [notifPerm, setNotifPerm] = useState(() => getNotificationPermission());
+
+  // Walkie-talkie local state
+  const [micMuted, setMicMuted] = useState(false);
+  const [speakerMuted, setSpeakerMuted] = useState(false);
+  const [radioStaticOn, setRadioStaticOn] = useState(true);
+  const [incomingRadioActive, setIncomingRadioActive] = useState(false);
+  const [radioRxCount, setRadioRxCount] = useState(0);
+
+  const speakerMutedRef = useRef(speakerMuted);
+  speakerMutedRef.current = speakerMuted;
+  const radioStaticOnRef = useRef(radioStaticOn);
+  radioStaticOnRef.current = radioStaticOn;
+  const myChannelRef = useRef(room.myRadioChannel);
+  myChannelRef.current = room.myRadioChannel;
+
+  // Sequential radio playback queue so multiple transmissions never garble together
+  const radioQueueRef = useRef<RadioIncomingPayload[]>([]);
+  const radioPlayingRef = useRef(false);
 
   const toastTimerRef = useRef<number | null>(null);
 
@@ -95,6 +131,55 @@ export function GameView({
   useEffect(() => {
     return () => {
       if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  // Listen for incoming walkie-talkie radio activity & audio clips across all tabs
+  useEffect(() => {
+    const socket = getSocket();
+
+    const drainQueue = async () => {
+      if (radioPlayingRef.current) return;
+      radioPlayingRef.current = true;
+      while (radioQueueRef.current.length > 0) {
+        const next = radioQueueRef.current.shift();
+        if (!next) continue;
+        if (next.channel !== myChannelRef.current || speakerMutedRef.current) {
+          continue;
+        }
+        setIncomingRadioActive(true);
+        try {
+          await playIncomingRadioClip(next.audio, next.mimeType, radioStaticOnRef.current);
+        } catch {
+          // Ignore playback error
+        }
+      }
+      setIncomingRadioActive(false);
+      radioPlayingRef.current = false;
+    };
+
+    const onActivity = (payload: RadioActivityPayload) => {
+      if (payload.channel !== myChannelRef.current) return;
+      if (!radioPlayingRef.current) {
+        setIncomingRadioActive(payload.active);
+      }
+    };
+
+    const onIncoming = (payload: RadioIncomingPayload) => {
+      if (payload.channel !== myChannelRef.current) return;
+      setRadioRxCount((c) => c + 1);
+      if (speakerMutedRef.current) return;
+      radioQueueRef.current.push(payload);
+      void drainQueue();
+    };
+
+    socket.on('radio:activity', onActivity);
+    socket.on('radio:incoming', onIncoming);
+
+    return () => {
+      socket.off('radio:activity', onActivity);
+      socket.off('radio:incoming', onIncoming);
+      radioQueueRef.current = [];
     };
   }, []);
 
@@ -185,7 +270,7 @@ export function GameView({
       isAlive
     ) {
       const title = `360° VIDEO PING #${round} DUE`;
-      const body = `Record live surroundings before the deadline or you are eliminated!`;
+      const body = 'Record live surroundings before the deadline or you are eliminated!';
       showToast(title, body, 'warn');
       triggerSystemAlert({
         title,
@@ -198,7 +283,7 @@ export function GameView({
     prevVideoPingRoundRef.current = round;
   }, [me?.pendingPing?.round, room.settings.mode, isRunner, isAlive, showToast]);
 
-  // 3. Location revealed alert in GPS mode (runner notified when THEIR location drops; hunters notified when ANY spot drops)
+  // 3. Location revealed alert in GPS mode
   useEffect(() => {
     const myGpsCount = room.gpsPings.filter((p) => p.playerId === room.meId).length;
     const latestPing = room.gpsPings[0];
@@ -214,11 +299,7 @@ export function GameView({
         vibratePattern: [180, 70, 240],
         tag: `manhunt-loc-revealed-${room.pingRound}`,
       });
-    } else if (
-      isHunter &&
-      latestPing &&
-      latestPing.id !== prevLatestGpsPingIdRef.current
-    ) {
+    } else if (isHunter && latestPing && latestPing.id !== prevLatestGpsPingIdRef.current) {
       const title = 'RUNNER LOCATION REVEALED!';
       const body = `${latestPing.playerName}'s GPS spot dropped on your map.`;
       showToast(title, body, 'info');
@@ -235,7 +316,7 @@ export function GameView({
     prevLatestGpsPingIdRef.current = latestPing?.id ?? null;
   }, [room.gpsPings, room.meId, room.pingRound, isRunner, isHunter, showToast]);
 
-  // 4. New 360 video received alert for hunters (and runner confirmation)
+  // 4. New 360 video received alert
   useEffect(() => {
     const latestVideo = room.videoPings[0];
     if (latestVideo && latestVideo.id !== prevLatestVideoIdRef.current) {
@@ -348,6 +429,9 @@ export function GameView({
   const radarToken = room.myRadarToken;
   const radarSpots = radarToken?.revealedHunters ?? [];
 
+  // Mandatory GPS Gate: alive players MUST have an active GPS fix while playing
+  const gpsBlocked = gpsEnabled && (gps.status === 'ERROR' || !gps.location);
+
   const handleActivateRadar = async () => {
     setRadarBusy(true);
     const res = await onUseRadarToken();
@@ -423,7 +507,7 @@ export function GameView({
                   ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
                   : 'border-borderSubtle bg-obsidian text-slate-400'
               }`}
-              title="Toggle Battery Saver (reduces GPS polling & releases screen wake lock)"
+              title="Toggle Battery Saver"
             >
               <BatteryCharging className="h-3.5 w-3.5" />
               {batterySaver ? 'Eco' : isAwake ? 'Awake' : 'Eco'}
@@ -564,7 +648,7 @@ export function GameView({
                 className="flex items-center justify-center gap-1 rounded-xl border border-borderSubtle bg-obsidian py-2 text-xs font-bold text-slate-300"
               >
                 <X className="h-3.5 w-3.5" />
-                Not Tagged
+                Still Safe
               </button>
             </div>
           </div>
@@ -684,8 +768,29 @@ export function GameView({
               gpsPings={room.settings.mode === 'GPS' ? room.gpsPings : []}
               radarSpots={radarSpots}
               nowMs={nowMs}
-              heightClass="h-[50vh] min-h-[280px]"
+              heightClass="h-[46vh] min-h-[260px]"
             />
+
+            {/* Alive Runner Quick Status Bar (Safe vs Caught with Confirmation Modal) */}
+            {isRunner && isAlive && room.phase === 'ACTIVE' && (
+              <div className="flex items-center justify-between gap-2 rounded-2xl border border-borderSubtle bg-surface p-2.5">
+                <div className="flex items-center gap-2 pl-1">
+                  <ShieldCheck className="h-4 w-4 text-emerald-400" />
+                  <div>
+                    <p className="text-xs font-black text-emerald-400">Status: Still Safe</p>
+                    <p className="text-[10px] text-slate-400">Tap only if tagged by a hunter</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCaughtModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/40 bg-red-500/15 px-3.5 py-2 text-xs font-black text-red-300 active:scale-95"
+                >
+                  <Skull className="h-3.5 w-3.5" />
+                  I Got Caught
+                </button>
+              </div>
+            )}
 
             {/* Compact GPS & Border Status Bar */}
             <div className="flex items-center justify-between rounded-2xl border border-borderSubtle bg-surface px-3.5 py-2.5 text-xs">
@@ -728,13 +833,6 @@ export function GameView({
                 </span>
               )}
             </div>
-
-            {gps.error && (
-              <div className="flex items-center gap-2 rounded-2xl border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] font-medium text-amber-200">
-                <ShieldAlert className="h-4 w-4 shrink-0 text-amber-400" />
-                {gps.error}
-              </div>
-            )}
 
             {/* Latest event ticker */}
             {room.events[0] && (
@@ -871,46 +969,39 @@ export function GameView({
           </div>
         )}
 
+        {activeTab === 'RADIO' && (
+          <RadioPanel
+            channel={room.myRadioChannel}
+            canTransmit={isAlive}
+            isHunter={isHunter}
+            micMuted={micMuted}
+            speakerMuted={speakerMuted}
+            staticEnabled={radioStaticOn}
+            incomingActive={incomingRadioActive}
+            incomingCount={radioRxCount}
+            onChangeChannel={onSetRadioChannel}
+            onToggleMicMute={() => setMicMuted((v) => !v)}
+            onToggleSpeakerMute={() => setSpeakerMuted((v) => !v)}
+            onToggleStatic={() => setRadioStaticOn((v) => !v)}
+            onTxStart={onRadioTxStart}
+            onTxEnd={onRadioTxEnd}
+            onTransmitClip={onRadioTransmit}
+          />
+        )}
+
         {activeTab === 'SQUAD' && (
           <div className="space-y-4">
             {/* Runner Self-Caught Action */}
             {isRunner && isAlive && room.phase === 'ACTIVE' && (
               <div className="rounded-3xl border border-red-500/35 bg-red-500/10 p-4">
-                {!confirmSelfCaught ? (
-                  <button
-                    type="button"
-                    onClick={() => setConfirmSelfCaught(true)}
-                    className="flex w-full items-center justify-center gap-2 rounded-2xl bg-red-600 py-3.5 text-sm font-black uppercase tracking-wide text-white active:scale-[0.98]"
-                  >
-                    <Skull className="h-4 w-4" />
-                    I Was Caught
-                  </button>
-                ) : (
-                  <div className="space-y-2.5 text-center">
-                    <p className="text-xs font-bold text-red-200">
-                      Confirm you were tagged by a hunter?
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmSelfCaught(false)}
-                        className="rounded-xl border border-borderSubtle bg-obsidian py-2.5 text-xs font-bold text-slate-300"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setConfirmSelfCaught(false);
-                          onSelfCaught();
-                        }}
-                        className="rounded-xl bg-red-600 py-2.5 text-xs font-black text-white"
-                      >
-                        Yes, Eliminated
-                      </button>
-                    </div>
-                  </div>
-                )}
+                <button
+                  type="button"
+                  onClick={() => setCaughtModalOpen(true)}
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl bg-red-600 py-3.5 text-sm font-black uppercase tracking-wide text-white active:scale-[0.98]"
+                >
+                  <Skull className="h-4 w-4" />
+                  Report: I Got Caught
+                </button>
               </div>
             )}
 
@@ -1069,13 +1160,13 @@ export function GameView({
         )}
       </main>
 
-      {/* Bottom Mobile Navigation */}
-      <nav className="safe-bottom shrink-0 border-t border-borderSubtle bg-surface/95 px-3 pt-2 backdrop-blur">
-        <div className="grid grid-cols-3 gap-1">
+      {/* Bottom 4-Tab Mobile Navigation */}
+      <nav className="safe-bottom shrink-0 border-t border-borderSubtle bg-surface/95 px-2 pt-2 backdrop-blur">
+        <div className="grid grid-cols-4 gap-1">
           <button
             type="button"
             onClick={() => setActiveTab('MAP')}
-            className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-bold transition ${
+            className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[10px] font-bold transition ${
               activeTab === 'MAP' ? 'bg-surfaceElevated text-emerald-400' : 'text-slate-400'
             }`}
           >
@@ -1086,7 +1177,7 @@ export function GameView({
           <button
             type="button"
             onClick={() => setActiveTab('INTEL')}
-            className={`relative flex flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-bold transition ${
+            className={`relative flex flex-col items-center gap-1 rounded-xl py-2 text-[10px] font-bold transition ${
               activeTab === 'INTEL' ? 'bg-surfaceElevated text-amber-400' : 'text-slate-400'
             }`}
           >
@@ -1097,7 +1188,7 @@ export function GameView({
             )}
             Intel
             {unreadIntel > 0 && (
-              <span className="absolute right-6 top-1.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-black text-white">
+              <span className="absolute right-3 top-1.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-black text-white">
                 {unreadIntel}
               </span>
             )}
@@ -1105,8 +1196,22 @@ export function GameView({
 
           <button
             type="button"
+            onClick={() => setActiveTab('RADIO')}
+            className={`relative flex flex-col items-center gap-1 rounded-xl py-2 text-[10px] font-bold transition ${
+              activeTab === 'RADIO' ? 'bg-surfaceElevated text-emerald-400' : 'text-slate-400'
+            }`}
+          >
+            <Radio className={`h-5 w-5 ${incomingRadioActive ? 'text-amber-400 animate-pulse' : ''}`} />
+            CH {String(room.myRadioChannel).padStart(2, '0')}
+            {incomingRadioActive && (
+              <span className="absolute right-3 top-1.5 h-2.5 w-2.5 rounded-full bg-amber-400 animate-ping" />
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveTab('SQUAD')}
-            className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-bold transition ${
+            className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[10px] font-bold transition ${
               activeTab === 'SQUAD' ? 'bg-surfaceElevated text-white' : 'text-slate-400'
             }`}
           >
@@ -1115,6 +1220,72 @@ export function GameView({
           </button>
         </div>
       </nav>
+
+      {/* 2-Step "I Got Caught" Confirmation Modal (prevents accidental taps) */}
+      {caughtModalOpen && isRunner && isAlive && (
+        <div className="fixed inset-0 z-[950] flex items-center justify-center bg-black/80 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-3xl border border-red-500/45 bg-surface p-5 shadow-2xl">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/20 text-red-400">
+              <Skull className="h-6 w-6" />
+            </div>
+            <h3 className="mt-3 text-center text-lg font-black text-white">
+              Confirm You Were Caught?
+            </h3>
+            <p className="mt-1.5 text-center text-xs text-slate-300">
+              This will immediately mark you as <span className="font-bold text-red-400">ELIMINATED</span> and notify all players. This cannot be undone.
+            </p>
+            <div className="mt-5 grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => setCaughtModalOpen(false)}
+                className="rounded-2xl border border-emerald-500/40 bg-emerald-500/15 py-3 text-xs font-black text-emerald-300 active:scale-95"
+              >
+                No, Still Safe
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCaughtModalOpen(false);
+                  onSelfCaught();
+                }}
+                className="rounded-2xl bg-red-600 py-3 text-xs font-black text-white active:scale-95"
+              >
+                Yes, I&apos;m Caught
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mandatory GPS Gate Overlay — GPS is required while actively playing */}
+      {gpsBlocked && (
+        <div className="fixed inset-0 z-[960] flex items-center justify-center bg-obsidian/95 px-5 backdrop-blur">
+          <div className="w-full max-w-sm rounded-3xl border border-amber-500/50 bg-surface p-6 text-center shadow-2xl">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/20 text-amber-400">
+              {gps.status === 'LOCATING' ? (
+                <Crosshair className="h-7 w-7 animate-spin" />
+              ) : (
+                <ShieldAlert className="h-7 w-7" />
+              )}
+            </div>
+            <h3 className="mt-3 text-lg font-black uppercase tracking-tight text-white">
+              {gps.status === 'LOCATING' ? 'Acquiring GPS Lock...' : 'GPS Required To Play'}
+            </h3>
+            <p className="mt-2 text-xs leading-relaxed text-slate-300">
+              {gps.error ??
+                'Manhunt IRL requires live GPS for block boundary checks, hunter tracking, and location pings. Turn on Location Services and allow access.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => gps.triggerFreshFix(false)}
+              className="mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-amber-400 py-3.5 text-xs font-black uppercase tracking-wide text-slate-950 active:scale-95"
+            >
+              <RefreshCw className="h-4 w-4" />
+              {gps.status === 'LOCATING' ? 'Refresh GPS Fix' : 'Enable / Retry GPS'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Fullscreen Live-Only 360 Video Recorder Modal */}
       {recorderOpen && videoPingDue && me?.pendingPing && me.pendingPing.challengeCode && (

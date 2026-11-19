@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Bell,
   Check,
   Copy,
+  Crosshair,
   Crown,
   Eye,
   LogOut,
@@ -16,7 +17,7 @@ import {
   Users,
   Video,
 } from 'lucide-react';
-import type { RoomSettings, RoomSnapshot } from '@shared/types';
+import type { GeoPoint, RoomSettings, RoomSnapshot } from '@shared/types';
 import { BoundaryMap } from '../components/BoundaryMap';
 import {
   getNotificationPermission,
@@ -24,10 +25,12 @@ import {
   unlockAudio,
 } from '../lib/alerts';
 import { formatDurationShort } from '../lib/geo';
+import { unlockRadioAudio } from '../lib/radioAudio';
 
 interface LobbyViewProps {
   room: RoomSnapshot;
   error: string | null;
+  onLocationUpdate: (point: GeoPoint, isGpsPing: boolean) => void;
   onUpdateSettings: (patch: Partial<RoomSettings>) => void;
   onKickPlayer: (playerId: string) => void;
   onStartGame: () => void;
@@ -43,6 +46,7 @@ const GRACE_OPTIONS = [0, 5, 10, 15];
 export function LobbyView({
   room,
   error,
+  onLocationUpdate,
   onUpdateSettings,
   onKickPlayer,
   onStartGame,
@@ -52,8 +56,59 @@ export function LobbyView({
   const isHost = Boolean(me?.isHost);
   const [copiedType, setCopiedType] = useState<'CODE' | 'LINK' | null>(null);
   const [notifPerm, setNotifPerm] = useState(() => getNotificationPermission());
+  const [gpsChecking, setGpsChecking] = useState(false);
+  const [gpsErr, setGpsErr] = useState<string | null>(null);
+
+  const verifyGps = () => {
+    if (!('geolocation' in navigator)) {
+      setGpsErr('GPS is not supported on this device.');
+      return;
+    }
+    setGpsChecking(true);
+    setGpsErr(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGpsChecking(false);
+        onLocationUpdate(
+          {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: Math.round(pos.coords.accuracy || 50),
+            timestamp: Date.now(),
+          },
+          false
+        );
+      },
+      (err) => {
+        setGpsChecking(false);
+        setGpsErr(
+          err.code === err.PERMISSION_DENIED
+            ? 'Location permission denied. Enable GPS in browser settings — GPS is required to play.'
+            : 'Could not lock GPS yet. Step near a window or outdoors and tap Retry.'
+        );
+      },
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 5000 }
+    );
+  };
+
+  // Auto-check GPS once if browser already granted permission
+  useEffect(() => {
+    if (me?.gpsReady) return;
+    if ('permissions' in navigator && navigator.permissions?.query) {
+      void navigator.permissions
+        .query({ name: 'geolocation' })
+        .then((status) => {
+          if (status.state === 'granted') {
+            verifyGps();
+          }
+        })
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleEnableAlerts = async () => {
+    unlockRadioAudio();
     const res = await requestNotificationPermission();
     setNotifPerm(res);
   };
@@ -172,6 +227,46 @@ export function LobbyView({
         </div>
       </div>
 
+      {/* Mandatory GPS Readiness Check */}
+      <div
+        className={`mb-4 rounded-2xl border p-3.5 ${
+          me?.gpsReady
+            ? 'border-emerald-500/35 bg-emerald-500/10'
+            : 'border-amber-500/45 bg-amber-500/12'
+        }`}
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Crosshair
+              className={`h-5 w-5 shrink-0 ${
+                me?.gpsReady ? 'text-emerald-400' : 'text-amber-400'
+              }`}
+            />
+            <div className="min-w-0">
+              <p className="text-xs font-black uppercase tracking-wide text-white">
+                {me?.gpsReady ? 'GPS Verified & Ready' : 'GPS Required To Play'}
+              </p>
+              <p className="text-[11px] text-slate-300">
+                {me?.gpsReady
+                  ? 'Your location is locked for boundary & hunt tracking.'
+                  : 'All players must enable GPS before entering the match.'}
+              </p>
+            </div>
+          </div>
+          {!me?.gpsReady && (
+            <button
+              type="button"
+              disabled={gpsChecking}
+              onClick={verifyGps}
+              className="shrink-0 rounded-xl bg-amber-400 px-3 py-2 text-xs font-black text-slate-950 active:scale-95 disabled:opacity-60"
+            >
+              {gpsChecking ? 'Locking...' : 'Enable GPS'}
+            </button>
+          )}
+        </div>
+        {gpsErr && <p className="mt-2 text-[11px] font-semibold text-red-300">{gpsErr}</p>}
+      </div>
+
       {/* Players Roster */}
       <div className="mb-4 rounded-3xl border border-borderSubtle bg-surface p-4">
         <div className="mb-3 flex items-center justify-between">
@@ -214,16 +309,27 @@ export function LobbyView({
                 )}
               </div>
 
-              {isHost && !p.isHost && (
-                <button
-                  type="button"
-                  onClick={() => onKickPlayer(p.id)}
-                  className="rounded-lg p-1.5 text-slate-500 hover:bg-red-500/10 hover:text-red-400"
-                  title={`Kick ${p.name}`}
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span
+                  className={`rounded-md px-1.5 py-0.5 text-[10px] font-bold ${
+                    p.gpsReady
+                      ? 'bg-emerald-500/15 text-emerald-400'
+                      : 'bg-amber-500/15 text-amber-300'
+                  }`}
                 >
-                  <UserX className="h-4 w-4" />
-                </button>
-              )}
+                  {p.gpsReady ? 'GPS ✓' : 'No GPS'}
+                </span>
+                {isHost && !p.isHost && (
+                  <button
+                    type="button"
+                    onClick={() => onKickPlayer(p.id)}
+                    className="rounded-lg p-1.5 text-slate-500 hover:bg-red-500/10 hover:text-red-400"
+                    title={`Kick ${p.name}`}
+                  >
+                    <UserX className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
             </div>
           ))}
         </div>
@@ -580,6 +686,7 @@ export function LobbyView({
               disabled={!canStart}
               onClick={() => {
                 unlockAudio();
+                unlockRadioAudio();
                 onStartGame();
               }}
               className="flex w-full items-center justify-center gap-2 rounded-2xl bg-red-500 py-4 text-sm font-black uppercase tracking-wide text-white shadow-[0_6px_24px_rgba(239,68,68,0.35)] transition active:scale-[0.98] disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none"

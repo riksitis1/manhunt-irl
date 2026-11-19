@@ -250,6 +250,26 @@ export function App() {
     return { ok: res.ok, error: res.error };
   };
 
+  const handleSetRadioChannel = (channel: number) => {
+    void emitAck('radio:setChannel', { channel });
+  };
+
+  const handleRadioTxStart = () => {
+    getSocket().emit('radio:txStart');
+  };
+
+  const handleRadioTxEnd = () => {
+    getSocket().emit('radio:txEnd');
+  };
+
+  const handleRadioTransmit = async (
+    audio: ArrayBuffer,
+    mimeType: string,
+    durationMs: number
+  ): Promise<void> => {
+    await emitAck('radio:transmit', { audio, mimeType, durationMs });
+  };
+
   return (
     <div className="h-full w-full overflow-y-auto bg-obsidian text-slate-100">
       {!connected && (
@@ -273,6 +293,7 @@ export function App() {
         <LobbyView
           room={room}
           error={error}
+          onLocationUpdate={handleLocationUpdate}
           onUpdateSettings={handleUpdateSettings}
           onKickPlayer={handleKick}
           onStartGame={handleStartGame}
@@ -296,6 +317,10 @@ export function App() {
           onHostEliminate={handleHostEliminate}
           onEndGame={handleEndGame}
           onUseRadarToken={handleUseRadarToken}
+          onSetRadioChannel={handleSetRadioChannel}
+          onRadioTxStart={handleRadioTxStart}
+          onRadioTxEnd={handleRadioTxEnd}
+          onRadioTransmit={handleRadioTransmit}
         />
       )}
 

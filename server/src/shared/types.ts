@@ -75,6 +75,7 @@ export interface PublicPlayer {
   name: string;
   isHost: boolean;
   connected: boolean;
+  gpsReady: boolean;
   role: PlayerRole;
   status: PlayerStatus;
   eliminatedAt?: number;
@@ -153,8 +154,26 @@ export interface RoomSnapshot {
   videoPings: VideoPingItem[];
   gpsPings: GpsPingItem[];
   events: MatchEvent[];
+  /** Private: viewer's current walkie-talkie channel (1..20). Never shown to other players. */
+  myRadioChannel: number;
   /** Private: only populated for the single runner randomly granted the 1-time Hunter Radar Token. */
   myRadarToken?: SecretRadarTokenState;
+}
+
+export const RADIO_CHANNEL_COUNT = 20;
+
+export interface RadioIncomingPayload {
+  id: string;
+  channel: number;
+  mimeType: string;
+  durationMs: number;
+  sentAt: number;
+  audio: ArrayBuffer | Uint8Array;
+}
+
+export interface RadioActivityPayload {
+  channel: number;
+  active: boolean;
 }
 
 export interface JoinSuccessPayload {

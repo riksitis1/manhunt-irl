@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { evaluateBoundary, isValidLatLng } from './geo.js';
 import {
   DEFAULT_ROOM_SETTINGS,
+  RADIO_CHANNEL_COUNT,
   type Boundary,
   type EliminationReason,
   type GamePhase,
@@ -35,6 +36,8 @@ interface InternalPlayer {
   name: string;
   isHost: boolean;
   connected: boolean;
+  gpsReady: boolean;
+  radioChannel: number;
   role: PlayerRole;
   status: PlayerStatus;
   eliminatedAt?: number;
@@ -46,6 +49,7 @@ interface InternalPlayer {
   pendingTagClaim?: PendingTagClaim;
   radarToken?: SecretRadarTokenState;
   lastLocationEventAt: number;
+  lastRadioTransmitAt: number;
 }
 
 interface InternalRoom {
@@ -211,9 +215,12 @@ export class GameManager {
       name,
       isHost: true,
       connected: true,
+      gpsReady: false,
+      radioChannel: 1,
       role: 'UNASSIGNED',
       status: 'ALIVE',
       lastLocationEventAt: 0,
+      lastRadioTransmitAt: 0,
     };
 
     const room: InternalRoom = {
@@ -290,9 +297,12 @@ export class GameManager {
       name: finalName,
       isHost: false,
       connected: true,
+      gpsReady: false,
+      radioChannel: 1,
       role: 'UNASSIGNED',
       status: 'ALIVE',
       lastLocationEventAt: 0,
+      lastRadioTransmitAt: 0,
     });
 
     room.lastActivityAt = Date.now();
@@ -818,6 +828,8 @@ export class GameManager {
         ? Math.max(1, Math.min(5000, Math.round(payload.accuracy)))
         : 50;
 
+    const wasGpsReady = player.gpsReady;
+    player.gpsReady = true;
     player.lastLocation = {
       lat: payload.lat,
       lng: payload.lng,
@@ -826,7 +838,7 @@ export class GameManager {
     };
     room.lastActivityAt = now;
 
-    let changed = false;
+    let changed = !wasGpsReady;
 
     // Hunters share live location with teammates
     if (player.role === 'HUNTER' && (room.phase === 'HEADSTART' || room.phase === 'ACTIVE')) {
@@ -1133,6 +1145,55 @@ export class GameManager {
     return { ok: true, roomCode: room.code, playerId: player.id };
   }
 
+  setRadioChannel(
+    socketId: string,
+    rawChannel: number
+  ): { ok: true; roomCode: string; playerId: string; channel: number } | { ok: false; error: string } {
+    const ctx = this.getSessionRoom(socketId);
+    if (!ctx) return { ok: false, error: 'Not in a room.' };
+    const { room, player } = ctx;
+
+    const channel = clampInt(rawChannel, 1, RADIO_CHANNEL_COUNT, player.radioChannel);
+    player.radioChannel = channel;
+    room.lastActivityAt = Date.now();
+    return { ok: true, roomCode: room.code, playerId: player.id, channel };
+  }
+
+  getRadioRecipients(
+    socketId: string,
+    isAudioTransmit: boolean
+  ):
+    | { ok: true; channel: number; recipientSocketIds: string[] }
+    | { ok: false; error: string } {
+    const ctx = this.getSessionRoom(socketId);
+    if (!ctx) return { ok: false, error: 'Not in a room.' };
+    const { room, player } = ctx;
+
+    // Prevent eliminated spectators from ghosting over radio during active hunt
+    if ((room.phase === 'HEADSTART' || room.phase === 'ACTIVE') && player.status === 'ELIMINATED') {
+      return { ok: false, error: 'Eliminated players are listen-only on radio.' };
+    }
+
+    if (isAudioTransmit) {
+      const now = Date.now();
+      if (now - player.lastRadioTransmitAt < 900) {
+        return { ok: false, error: 'Wait a moment before transmitting again.' };
+      }
+      player.lastRadioTransmitAt = now;
+    }
+
+    room.lastActivityAt = Date.now();
+    const channel = player.radioChannel;
+    const recipientSocketIds: string[] = [];
+    for (const p of room.players) {
+      if (p.id !== player.id && p.socketId && p.connected && p.radioChannel === channel) {
+        recipientSocketIds.push(p.socketId);
+      }
+    }
+
+    return { ok: true, channel, recipientSocketIds };
+  }
+
   private eliminatePlayer(
     room: InternalRoom,
     target: InternalPlayer,
@@ -1229,6 +1290,7 @@ export class GameManager {
         name: p.name,
         isHost: p.isHost,
         connected: p.connected,
+        gpsReady: p.gpsReady,
         role: p.role,
         status: p.status,
         eliminatedAt: p.eliminatedAt,
@@ -1271,6 +1333,7 @@ export class GameManager {
       videoPings: room.videoPings,
       gpsPings: room.gpsPings,
       events: room.events,
+      myRadioChannel: viewer?.radioChannel ?? 1,
       myRadarToken: viewer?.radarToken,
     };
   }

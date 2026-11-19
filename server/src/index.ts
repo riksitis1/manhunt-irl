@@ -1,5 +1,6 @@
 import compression from 'compression';
 import cors from 'cors';
+import crypto from 'node:crypto';
 import express from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -27,6 +28,8 @@ const io = new Server(server, {
     origin: true,
     credentials: true,
   },
+  // Allow compact walkie-talkie PTT audio clips (<= 256 KB) cleanly
+  maxHttpBufferSize: 512 * 1024,
   // Battery-friendly heartbeat intervals (avoid aggressive mobile radio wakeups)
   pingInterval: 25_000,
   pingTimeout: 20_000,
@@ -303,6 +306,91 @@ io.on('connection', (socket) => {
     }
     ack?.({ ok: true });
   });
+
+  socket.on(
+    'radio:setChannel',
+    (payload: { channel: number }, ack?: (res: SocketAck<{ channel: number }>) => void) => {
+      const res = gameManager.setRadioChannel(socket.id, Number(payload?.channel ?? 1));
+      if (!res.ok) {
+        ack?.({ ok: false, error: res.error });
+        return;
+      }
+      // Private update ONLY to this socket so switching channels to spy is completely silent
+      const privateSnap = gameManager.buildSnapshotFor(res.roomCode, res.playerId);
+      if (privateSnap) {
+        socket.emit('room:state', privateSnap);
+      }
+      ack?.({ ok: true, data: { channel: res.channel } });
+    }
+  );
+
+  socket.on('radio:txStart', () => {
+    const res = gameManager.getRadioRecipients(socket.id, false);
+    if (!res.ok) return;
+    for (const targetSocketId of res.recipientSocketIds) {
+      io.to(targetSocketId).emit('radio:activity', { channel: res.channel, active: true });
+    }
+  });
+
+  socket.on('radio:txEnd', () => {
+    const res = gameManager.getRadioRecipients(socket.id, false);
+    if (!res.ok) return;
+    for (const targetSocketId of res.recipientSocketIds) {
+      io.to(targetSocketId).emit('radio:activity', { channel: res.channel, active: false });
+    }
+  });
+
+  socket.on(
+    'radio:transmit',
+    (
+      payload: { audio: Buffer | ArrayBuffer | Uint8Array; mimeType: string; durationMs: number },
+      ack?: (res: SocketAck) => void
+    ) => {
+      const res = gameManager.getRadioRecipients(socket.id, true);
+      if (!res.ok) {
+        ack?.({ ok: false, error: res.error });
+        return;
+      }
+
+      const raw = payload?.audio;
+      const buf = Buffer.isBuffer(raw)
+        ? raw
+        : raw instanceof Uint8Array
+          ? Buffer.from(raw)
+          : raw instanceof ArrayBuffer
+            ? Buffer.from(new Uint8Array(raw))
+            : null;
+
+      if (!buf || buf.byteLength === 0 || buf.byteLength > 262_144) {
+        ack?.({ ok: false, error: 'Invalid radio audio clip.' });
+        return;
+      }
+
+      const mimeType =
+        typeof payload.mimeType === 'string' && payload.mimeType.startsWith('audio/')
+          ? payload.mimeType.slice(0, 60)
+          : 'audio/webm';
+      const durationMs =
+        typeof payload.durationMs === 'number' && Number.isFinite(payload.durationMs)
+          ? Math.max(200, Math.min(20_000, Math.round(payload.durationMs)))
+          : 2000;
+
+      const outgoing = {
+        id: crypto.randomBytes(6).toString('hex'),
+        channel: res.channel,
+        mimeType,
+        durationMs,
+        sentAt: Date.now(),
+        audio: buf,
+      };
+
+      for (const targetSocketId of res.recipientSocketIds) {
+        io.to(targetSocketId).emit('radio:incoming', outgoing);
+      }
+
+      ack?.({ ok: true });
+    }
+  );
 
   socket.on('disconnect', () => {
     gameManager.handleDisconnect(socket.id);
